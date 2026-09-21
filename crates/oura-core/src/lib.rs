@@ -760,34 +760,6 @@ impl RingSession {
                 // builds incorrectly treated that as a successful empty terminal batch,
                 // leaving retained history unseen. Rebase transactionally; inserts are
                 // deduplicated, and checkpoint zero makes a reconnect resume recovery.
-                //
-                // But 0xff does not distinguish "your cursor is invalid" from "your
-                // cursor is at the end, nothing new". Rebasing on the latter re-pulls
-                // the ring's entire retained history on EVERY sync — hours of transfer
-                // that dedupe to almost no new rows. Only a database with no events for
-                // this ring can be certain it is missing history, so restrict the
-                // recovery to that case and treat 0xff on a populated database as the
-                // empty sync it almost certainly is.
-                let first_sync = !store
-                    .lock()
-                    .unwrap()
-                    .has_events(&serial)
-                    .map_err(|e| storage_failure("has_events", e, cursor))?;
-                if !first_sync {
-                    progress.on_progress("up-to-date".into(), 0, 0);
-                    return Ok(SyncReport {
-                        serial,
-                        events_synced: 0,
-                        inserted: 0,
-                        next_cursor: cursor,
-                        path: "ext".to_string(),
-                        rebased: false,
-                        batches: 0,
-                        flush_ms: 0,
-                        fetch_ms: 0,
-                        ack_ms: 0,
-                    });
-                }
                 store
                     .lock()
                     .unwrap()
@@ -813,15 +785,7 @@ impl RingSession {
             let marker_present = cursor_marker_present(&client, cursor)
                 .await
                 .map_err(&fail)?;
-            // Same restriction as the 0xff path: a populated database re-pulling the
-            // ring's whole history costs hours and dedupes to nothing. An absent marker
-            // is only firm evidence of missing history when nothing was ever stored.
-            let first_sync = !store
-                .lock()
-                .unwrap()
-                .has_events(&serial)
-                .map_err(|e| storage_failure("has_events", e, cursor))?;
-            if first_sync && should_rebase_cursor(cursor, outcome.events_synced, marker_present) {
+            if should_rebase_cursor(cursor, outcome.events_synced, marker_present) {
                 marker_rebased = true;
                 // Checkpoint zero before the recovery drain: if BLE drops midway, the
                 // existing reconnect loop resumes the new epoch instead of retrying the
