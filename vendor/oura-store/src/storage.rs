@@ -216,6 +216,21 @@ impl Store {
         Ok(present != 0)
     }
 
+    /// Total events stored for `serial` and the newest ring timestamp among
+    /// them. Reported before a drain starts so a database that lost its history
+    /// — an app container wiped by a reinstall, say — is visible immediately
+    /// rather than inferred hours later from a sync that re-pulls everything.
+    pub fn event_stats(&self, serial: &str) -> Result<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(ring_timestamp), 0)
+                   FROM events WHERE serial = ?1",
+                params![serial],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn cursor(&self, serial: &str) -> Result<u32> {
         let v: Option<i64> = self
             .conn

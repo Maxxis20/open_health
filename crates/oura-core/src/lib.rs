@@ -715,6 +715,21 @@ impl RingSession {
             .cursor(&serial)
             .map_err(|e| storage_failure("read_cursor", e, 0))?;
 
+        // Report what the database already holds BEFORE draining anything. A sync
+        // that re-pulls the ring's whole history looks identical whether the cursor
+        // misbehaved or the local database lost its events (an app container wiped
+        // by a reinstall, for instance), and the two need opposite fixes.
+        let (stored_events, newest) = store
+            .lock()
+            .unwrap()
+            .event_stats(&serial)
+            .map_err(|e| storage_failure("event_stats", e, cursor))?;
+        progress.on_progress(
+            format!("db events={stored_events} cursor={cursor} newest={newest}"),
+            0,
+            0,
+        );
+
         let inserted = AtomicU32::new(0);
         let db_err: Mutex<Option<SyncError>> = Mutex::new(None);
         progress.on_progress("sync".into(), 0, 0);
