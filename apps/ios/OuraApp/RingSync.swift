@@ -711,7 +711,7 @@ final class RingSync: ObservableObject {
                 UserDefaults.standard.set(completedAt.timeIntervalSince1970,
                                           forKey: Self.lastSuccessfulSyncKey)
                 clearIncompleteSync()
-                dlog("sync", "OK run=\(runID) inserted=\(report.inserted) events=\(report.eventsSynced) cursor=\(report.nextCursor) path=\(report.path)\(report.rebased ? " rebased=1" : "")")
+                dlog("sync", "OK run=\(runID) inserted=\(report.inserted) events=\(report.eventsSynced) cursor=\(report.nextCursor) path=\(report.path)\(report.rebased ? " rebased=1" : "") batches=\(report.batches) flushMs=\(report.flushMs) fetchMs=\(report.fetchMs) ackMs=\(report.ackMs)")
                 status = "Sync complete."
                 return report
             } catch {
@@ -759,6 +759,8 @@ final class RingSync: ObservableObject {
             status = "Checking pairing key…"
         case "setup":
             status = "Preparing your ring…"
+        case "up-to-date":
+            status = "Already up to date"
         case "rebase":
             status = "Recovering ring history…"
             dlog("sync", "saved cursor is absent on ring; rebasing to the new boot epoch")

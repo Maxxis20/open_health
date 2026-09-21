@@ -966,6 +966,17 @@ public struct SyncReport {
      * is expected; every sync means the cursor is not holding.
      */
     public var rebased: Bool
+    /**
+     * Batches taken and where their wall clock went, in milliseconds. Round-trip
+     * overhead and slow event streaming produce the same "sync is slow" symptom;
+     * `fetch_ms` dominating means the ring streams slowly and fewer, bigger
+     * batches will not help, while `flush_ms + ack_ms` dominating means the
+     * round trips are the cost.
+     */
+    public var batches: UInt32
+    public var flushMs: UInt64
+    public var fetchMs: UInt64
+    public var ackMs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -979,13 +990,24 @@ public struct SyncReport {
          * Whether the saved cursor was rejected or unverifiable and the drain
          * restarted from zero, re-pulling the ring's entire retained history. Once
          * is expected; every sync means the cursor is not holding.
-         */rebased: Bool) {
+         */rebased: Bool, 
+        /**
+         * Batches taken and where their wall clock went, in milliseconds. Round-trip
+         * overhead and slow event streaming produce the same "sync is slow" symptom;
+         * `fetch_ms` dominating means the ring streams slowly and fewer, bigger
+         * batches will not help, while `flush_ms + ack_ms` dominating means the
+         * round trips are the cost.
+         */batches: UInt32, flushMs: UInt64, fetchMs: UInt64, ackMs: UInt64) {
         self.serial = serial
         self.eventsSynced = eventsSynced
         self.inserted = inserted
         self.nextCursor = nextCursor
         self.path = path
         self.rebased = rebased
+        self.batches = batches
+        self.flushMs = flushMs
+        self.fetchMs = fetchMs
+        self.ackMs = ackMs
     }
 }
 
@@ -1011,6 +1033,18 @@ extension SyncReport: Equatable, Hashable {
         if lhs.rebased != rhs.rebased {
             return false
         }
+        if lhs.batches != rhs.batches {
+            return false
+        }
+        if lhs.flushMs != rhs.flushMs {
+            return false
+        }
+        if lhs.fetchMs != rhs.fetchMs {
+            return false
+        }
+        if lhs.ackMs != rhs.ackMs {
+            return false
+        }
         return true
     }
 
@@ -1021,6 +1055,10 @@ extension SyncReport: Equatable, Hashable {
         hasher.combine(nextCursor)
         hasher.combine(path)
         hasher.combine(rebased)
+        hasher.combine(batches)
+        hasher.combine(flushMs)
+        hasher.combine(fetchMs)
+        hasher.combine(ackMs)
     }
 }
 
@@ -1037,7 +1075,11 @@ public struct FfiConverterTypeSyncReport: FfiConverterRustBuffer {
                 inserted: FfiConverterUInt32.read(from: &buf), 
                 nextCursor: FfiConverterUInt32.read(from: &buf), 
                 path: FfiConverterString.read(from: &buf), 
-                rebased: FfiConverterBool.read(from: &buf)
+                rebased: FfiConverterBool.read(from: &buf), 
+                batches: FfiConverterUInt32.read(from: &buf), 
+                flushMs: FfiConverterUInt64.read(from: &buf), 
+                fetchMs: FfiConverterUInt64.read(from: &buf), 
+                ackMs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -1048,6 +1090,10 @@ public struct FfiConverterTypeSyncReport: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.nextCursor, into: &buf)
         FfiConverterString.write(value.path, into: &buf)
         FfiConverterBool.write(value.rebased, into: &buf)
+        FfiConverterUInt32.write(value.batches, into: &buf)
+        FfiConverterUInt64.write(value.flushMs, into: &buf)
+        FfiConverterUInt64.write(value.fetchMs, into: &buf)
+        FfiConverterUInt64.write(value.ackMs, into: &buf)
     }
 }
 

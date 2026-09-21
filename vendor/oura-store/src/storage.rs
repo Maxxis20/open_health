@@ -203,6 +203,19 @@ impl Store {
     }
 
     /// The persisted incremental-sync cursor (deciseconds), or 0 if none.
+    /// Whether any event is already stored for `serial`. Cheap (index-only
+    /// existence check) and deliberately not a count: callers want to know
+    /// "has this ring ever been drained into this database", to tell a genuine
+    /// first sync apart from a populated one.
+    pub fn has_events(&self, serial: &str) -> Result<bool> {
+        let present: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE serial = ?1)",
+            params![serial],
+            |r| r.get(0),
+        )?;
+        Ok(present != 0)
+    }
+
     pub fn cursor(&self, serial: &str) -> Result<u32> {
         let v: Option<i64> = self
             .conn

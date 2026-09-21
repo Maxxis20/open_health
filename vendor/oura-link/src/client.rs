@@ -76,6 +76,13 @@ pub struct LatestValues {
 pub struct SyncOutcome {
     pub events_synced: u32,
     pub next_cursor: u32,
+    /// Batches the drain took, and where their wall clock went. A sync that is
+    /// slow because of round trips and one that is slow because the ring streams
+    /// events slowly look identical from the outside; this separates them.
+    pub batches: u32,
+    pub flush_ms: u64,
+    pub fetch_ms: u64,
+    pub ack_ms: u64,
     /// Which event API actually served the drain. The legacy path costs three
     /// round trips per 255 events against the extended path's one per
     /// [`EXT_BATCH_MAX_EVENTS`], so a slow sync is diagnosed by this field
@@ -114,6 +121,12 @@ pub struct BatchProgress {
     pub next_cursor: u32,
     pub bytes_left: u32,
     pub events_synced: u32,
+    /// Running cost so far, so a caller can report where the time is going
+    /// without waiting for a drain that may not finish for hours.
+    pub batches: u32,
+    pub flush_ms: u64,
+    pub fetch_ms: u64,
+    pub ack_ms: u64,
 }
 
 /// Quiet-window fallback for event-batch requests. Batches terminate on the
@@ -479,6 +492,8 @@ impl<T: Transport> OuraClient<T> {
     {
         let mut start = cursor;
         let mut total = 0u32;
+        let mut batches = 0u32;
+        let (mut flush_ms, mut fetch_ms, mut ack_ms) = (0u64, 0u64, 0u64);
         // Prefer Ring 5's Android-style extended event drain. It falls back to
         // legacy GetEvent if the ring explicitly reports the extended API as
         // unsupported.
@@ -491,7 +506,11 @@ impl<T: Transport> OuraClient<T> {
         };
         // Safety bound against a misbehaving ring that never reports drained.
         for _ in 0..100_000 {
+            batches += 1;
+            let t0 = std::time::Instant::now();
             let mut packets = self.request_tag(&protocol::req_data_flush(), 0x29).await?;
+            flush_ms += t0.elapsed().as_millis() as u64;
+            let t_fetch = std::time::Instant::now();
             if use_extended {
                 let ext = self
                     .request_batch(
@@ -526,6 +545,7 @@ impl<T: Transport> OuraClient<T> {
                 );
             }
 
+            fetch_ms += t_fetch.elapsed().as_millis() as u64;
             let batch = decode_batch(&packets).map_err(|e| {
                 Error::Protocol(format!(
                     "{e} — BLE link lost mid-batch? cursor {start} is checkpointed; \
@@ -559,6 +579,10 @@ impl<T: Transport> OuraClient<T> {
                 next_cursor: start,
                 bytes_left,
                 events_synced: total,
+                batches,
+                flush_ms,
+                fetch_ms,
+                ack_ms,
             }) {
                 return Err(Error::Protocol(
                     "batch callback failed; not acknowledging batch".into(),
@@ -569,9 +593,11 @@ impl<T: Transport> OuraClient<T> {
             // those late frames race with the next flush and get discarded. Only the
             // legacy API uses the explicit 0x10 acknowledgement.
             if progressed && !use_extended {
+                let t_ack = std::time::Instant::now();
                 let _ = self
                     .request_tag(&protocol::req_get_event_ack(start), 0x11)
                     .await;
+                ack_ms += t_ack.elapsed().as_millis() as u64;
             }
             if !progressed {
                 if bytes_left == 0 {
@@ -594,6 +620,10 @@ impl<T: Transport> OuraClient<T> {
         Ok(SyncOutcome {
             events_synced: total,
             next_cursor: start,
+            batches,
+            flush_ms,
+            fetch_ms,
+            ack_ms,
             path: if use_extended {
                 DrainPath::Extended
             } else {
