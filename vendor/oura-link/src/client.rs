@@ -603,6 +603,18 @@ impl<T: Transport> OuraClient<T> {
                 if bytes_left == 0 {
                     break; // drained: a pass returned nothing and the ring agrees
                 }
+                // A batch that carried events but none at or after the cursor means
+                // the ring is replaying from its buffer head and ignoring where we
+                // asked it to start. Continuing would advance the cursor one
+                // decisecond per round trip and re-serve the same history forever.
+                if !batch.events.is_empty() {
+                    return Err(Error::Protocol(format!(
+                        "ring replayed {} event(s) older than cursor {start} and reports \
+                         {bytes_left} bytes left — it is ignoring the cursor, stopping \
+                         instead of crawling forward one decisecond per batch",
+                        batch.events.len()
+                    )));
+                }
                 return Err(Error::Protocol(format!(
                     "ring reports {bytes_left} bytes of events left but the batch \
                      contained none — stopping instead of looping (cursor {start})"
@@ -981,16 +993,26 @@ mod tests {
         );
     }
 
+    /// The exact extended-fetch request the drain sends for `start_ms`, so mock
+    /// keys track [`EXT_BATCH_MAX_EVENTS`] instead of hard-coding its encoding.
+    fn ext_request(start_ms: u64) -> String {
+        hex::encode(protocol::req_ext_get_event(
+            start_ms,
+            EXT_BATCH_MAX_EVENTS,
+            0,
+        ))
+    }
+
     #[tokio::test]
     async fn extended_drain_does_not_send_legacy_ack() {
         let mock = MockTransport::new();
         mock.on("280100", &["290100"]);
         mock.on(
-            "2f0c410000000000000000000010",
+            &ext_request(0),
             &["2f09430600aa430364bbcc2f0a42010000000000000000"],
         );
         // the confirming pass at cursor 2 comes back empty
-        mock.on("2f0c4100c8000000000000000010", &["2f0a42000000000000000000"]);
+        mock.on(&ext_request(200), &["2f0a42000000000000000000"]);
         let client = OuraClient::new(mock).with_quiet(Duration::from_millis(20));
         let outcome = client.drain_events(0, |_| true, |_| true).await.unwrap();
         assert_eq!(outcome.events_synced, 1);
@@ -1010,16 +1032,16 @@ mod tests {
         mock.on("280100", &["290100"]);
         // cursor 0 → one event at t=1 ds, bytes_left=0
         mock.on(
-            "2f0c410000000000000000000010",
+            &ext_request(0),
             &["2f09430600aa430364bbcc2f0a42010000000000000000"],
         );
         // cursor 2 (200 ms) → another event at t=2 ds, still bytes_left=0
         mock.on(
-            "2f0c4100c8000000000000000010",
+            &ext_request(200),
             &["2f0a430700aa4304c801bbcc2f0a42010000000000000000"],
         );
         // cursor 3 (300 ms) → nothing: drained for real
-        mock.on("2f0c41002c010000000000000010", &["2f0a42000000000000000000"]);
+        mock.on(&ext_request(300), &["2f0a42000000000000000000"]);
         let client = OuraClient::new(mock).with_quiet(Duration::from_millis(20));
         let outcome = client.drain_events(0, |_| true, |_| true).await.unwrap();
         assert_eq!(outcome.events_synced, 2);

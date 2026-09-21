@@ -22,3 +22,10 @@ btleplug = { version = "0.11", optional = true }
 [features]
 default = ["ble"]
 ble = ["dep:btleplug"]
+
+# The scan example needs the BLE backend, which is off when the iOS build pulls
+# this crate in with default features disabled. Without this the example breaks
+# `cargo test -p oura-link` in that configuration.
+[[example]]
+name = "rawscan"
+required-features = ["ble"]
