@@ -711,7 +711,7 @@ final class RingSync: ObservableObject {
                 UserDefaults.standard.set(completedAt.timeIntervalSince1970,
                                           forKey: Self.lastSuccessfulSyncKey)
                 clearIncompleteSync()
-                dlog("sync", "OK run=\(runID) inserted=\(report.inserted) events=\(report.eventsSynced) cursor=\(report.nextCursor)")
+                dlog("sync", "OK run=\(runID) inserted=\(report.inserted) events=\(report.eventsSynced) cursor=\(report.nextCursor) path=\(report.path)\(report.rebased ? " rebased=1" : "")")
                 status = "Sync complete."
                 return report
             } catch {

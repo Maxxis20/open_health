@@ -954,14 +954,38 @@ public struct SyncReport {
     public var eventsSynced: UInt32
     public var inserted: UInt32
     public var nextCursor: UInt32
+    /**
+     * Which event API served the drain: `"ext"` or `"legacy"`. The legacy path
+     * costs three round trips per 255 events, so it is the first thing to check
+     * when a sync takes hours.
+     */
+    public var path: String
+    /**
+     * Whether the saved cursor was rejected or unverifiable and the drain
+     * restarted from zero, re-pulling the ring's entire retained history. Once
+     * is expected; every sync means the cursor is not holding.
+     */
+    public var rebased: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(serial: String, eventsSynced: UInt32, inserted: UInt32, nextCursor: UInt32) {
+    public init(serial: String, eventsSynced: UInt32, inserted: UInt32, nextCursor: UInt32, 
+        /**
+         * Which event API served the drain: `"ext"` or `"legacy"`. The legacy path
+         * costs three round trips per 255 events, so it is the first thing to check
+         * when a sync takes hours.
+         */path: String, 
+        /**
+         * Whether the saved cursor was rejected or unverifiable and the drain
+         * restarted from zero, re-pulling the ring's entire retained history. Once
+         * is expected; every sync means the cursor is not holding.
+         */rebased: Bool) {
         self.serial = serial
         self.eventsSynced = eventsSynced
         self.inserted = inserted
         self.nextCursor = nextCursor
+        self.path = path
+        self.rebased = rebased
     }
 }
 
@@ -981,6 +1005,12 @@ extension SyncReport: Equatable, Hashable {
         if lhs.nextCursor != rhs.nextCursor {
             return false
         }
+        if lhs.path != rhs.path {
+            return false
+        }
+        if lhs.rebased != rhs.rebased {
+            return false
+        }
         return true
     }
 
@@ -989,6 +1019,8 @@ extension SyncReport: Equatable, Hashable {
         hasher.combine(eventsSynced)
         hasher.combine(inserted)
         hasher.combine(nextCursor)
+        hasher.combine(path)
+        hasher.combine(rebased)
     }
 }
 
@@ -1003,7 +1035,9 @@ public struct FfiConverterTypeSyncReport: FfiConverterRustBuffer {
                 serial: FfiConverterString.read(from: &buf), 
                 eventsSynced: FfiConverterUInt32.read(from: &buf), 
                 inserted: FfiConverterUInt32.read(from: &buf), 
-                nextCursor: FfiConverterUInt32.read(from: &buf)
+                nextCursor: FfiConverterUInt32.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                rebased: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1012,6 +1046,8 @@ public struct FfiConverterTypeSyncReport: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.eventsSynced, into: &buf)
         FfiConverterUInt32.write(value.inserted, into: &buf)
         FfiConverterUInt32.write(value.nextCursor, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterBool.write(value.rebased, into: &buf)
     }
 }
 

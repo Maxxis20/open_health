@@ -1340,7 +1340,6 @@ dependencies = [
 [[package]]
 name = "oura-link"
 version = "0.1.0"
-source = "git+https://github.com/Th0rgal/open_oura?rev=bd2f1508fbd571b7742b56c0bfd32d8f16e29585#bd2f1508fbd571b7742b56c0bfd32d8f16e29585"
 dependencies = [
  "async-trait",
  "btleplug",

@@ -263,6 +263,14 @@ pub struct SyncReport {
     pub events_synced: u32,
     pub inserted: u32,
     pub next_cursor: u32,
+    /// Which event API served the drain: `"ext"` or `"legacy"`. The legacy path
+    /// costs three round trips per 255 events, so it is the first thing to check
+    /// when a sync takes hours.
+    pub path: String,
+    /// Whether the saved cursor was rejected or unverifiable and the drain
+    /// restarted from zero, re-pulling the ring's entire retained history. Once
+    /// is expected; every sync means the cursor is not holding.
+    pub rebased: bool,
 }
 
 /// What a successful [`RingSession::pair`] installed.
@@ -702,6 +710,7 @@ impl RingSession {
         )
         .await;
         let mut rejected_cursor_rebased = false;
+        let mut marker_rebased = false;
         let mut outcome = match first_drain {
             Ok(outcome) => outcome,
             Err(error) if cursor > 0 && is_rejected_history_cursor(&error.to_string()) => {
@@ -735,6 +744,7 @@ impl RingSession {
                 .await
                 .map_err(&fail)?;
             if should_rebase_cursor(cursor, outcome.events_synced, marker_present) {
+                marker_rebased = true;
                 // Checkpoint zero before the recovery drain: if BLE drops midway, the
                 // existing reconnect loop resumes the new epoch instead of retrying the
                 // stale/poisoned cursor and reporting another false success.
@@ -769,6 +779,8 @@ impl RingSession {
             events_synced: outcome.events_synced,
             inserted: inserted.into_inner(),
             next_cursor: outcome.next_cursor,
+            path: outcome.path.as_str().to_string(),
+            rebased: rejected_cursor_rebased || marker_rebased,
         })
     }
 }
