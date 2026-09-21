@@ -413,8 +413,16 @@ async fn drain_into_store(
                         // where its time went. The UI reads bytes_left/events, not this.
                         progress.on_progress(
                             format!(
-                                "sync b={} flush={}ms fetch={}ms ack={}ms",
-                                p.batches, p.flush_ms, p.fetch_ms, p.ack_ms
+                                "sync b={} flush={}ms fetch={}ms ack={}ms{}",
+                                p.batches,
+                                p.flush_ms,
+                                p.fetch_ms,
+                                p.ack_ms,
+                                if p.census.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" frames={}", p.census)
+                                }
                             ),
                             p.bytes_left as u64,
                             p.events_synced,

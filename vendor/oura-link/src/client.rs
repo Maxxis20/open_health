@@ -116,7 +116,7 @@ impl std::fmt::Display for DrainPath {
 
 /// Progress after each fully-processed event batch: the checkpointed cursor,
 /// the ring's own count of bytes still waiting, and events synced so far.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BatchProgress {
     pub next_cursor: u32,
     pub bytes_left: u32,
@@ -127,6 +127,48 @@ pub struct BatchProgress {
     pub flush_ms: u64,
     pub fetch_ms: u64,
     pub ack_ms: u64,
+    /// Packet census for the opening batches, empty thereafter.
+    pub census: String,
+}
+
+/// Firmware log events the ring writes into its own history buffer while it is
+/// being talked to: `debug_event` (0x43), `debug_data` (0x61) and
+/// `ble_connection` (0x5b). Every command of a drain iteration produces a few of
+/// these, so a drain that waits for an empty pass fetches its own exhaust forever.
+fn is_sync_chatter(tag: u8) -> bool {
+    matches!(tag, 0x43 | 0x5b | 0x61)
+}
+
+/// Consecutive chatter-only batches, with the ring reporting nothing left, that
+/// mean the drain has caught up with the present and is now only fetching the
+/// log lines its own previous round trip produced. More than one, so a short
+/// debug-only stretch inside a genuine backlog does not end a sync early; if it
+/// ever does, the cursor is checkpointed and the next sync simply carries on.
+const CHATTER_DRAINED_STREAK: u32 = 3;
+
+/// A compact census of the packets a batch returned: tag, extended sub-opcode
+/// and count, e.g. `2f/43x23,2f/42x1`. Reported for the first few batches so the
+/// frame that truncates a batch can be identified without a raw BLE capture —
+/// `tracing` output is not wired to a subscriber on iOS and goes nowhere.
+fn tag_census(packets: &[Packet]) -> String {
+    let mut counts: std::collections::BTreeMap<(u8, Option<u8>), u32> =
+        std::collections::BTreeMap::new();
+    for p in packets {
+        let sub = if p.tag == 0x2f {
+            p.payload.first().copied()
+        } else {
+            None
+        };
+        *counts.entry((p.tag, sub)).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((tag, sub), n)| match sub {
+            Some(sub) => format!("{tag:02x}/{sub:02x}x{n}"),
+            None => format!("{tag:02x}x{n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Quiet-window fallback for event-batch requests. Batches terminate on the
@@ -494,10 +536,15 @@ impl<T: Transport> OuraClient<T> {
         let mut total = 0u32;
         let mut batches = 0u32;
         let (mut flush_ms, mut fetch_ms, mut ack_ms) = (0u64, 0u64, 0u64);
-        // Prefer Ring 5's Android-style extended event drain. It falls back to
-        // legacy GetEvent if the ring explicitly reports the extended API as
-        // unsupported.
-        let mut use_extended = true;
+        // Prefer Ring 5's Android-style extended event drain. A fallback to legacy
+        // GetEvent used to be permanent, which cost this dearly: one stray frame at
+        // the second batch dropped a 22k-event sync onto a path that served NINE
+        // events per round trip for the remaining 2444 batches. Back off instead,
+        // and re-probe — a wasted probe costs one round trip, while staying on
+        // legacy costs thousands.
+        let mut ext_off_for = 0u32;
+        let mut ext_failures = 0u32;
+        let mut chatter_streak = 0u32;
         // A batch is over when the ring's summary packet arrives (0x11 legacy /
         // ext 0x42) — the same terminator the official app waits for. An ext
         // status packet (payload[0]=0x00, "unsupported") also ends the request.
@@ -507,6 +554,8 @@ impl<T: Transport> OuraClient<T> {
         // Safety bound against a misbehaving ring that never reports drained.
         for _ in 0..100_000 {
             batches += 1;
+            // Give up on the extended API only after repeated, unambiguous refusals.
+            let mut use_extended = ext_off_for == 0 && ext_failures < 8;
             let t0 = std::time::Instant::now();
             let mut packets = self.request_tag(&protocol::req_data_flush(), 0x29).await?;
             flush_ms += t0.elapsed().as_millis() as u64;
@@ -518,10 +567,21 @@ impl<T: Transport> OuraClient<T> {
                         batch_terminal,
                     )
                     .await?;
-                let unsupported = ext
-                    .iter()
-                    .any(|p| p.tag == 0x2f && p.payload.first().copied() == Some(0x00));
+                // A 0x2f frame whose sub-opcode is 0x00 only means "extended
+                // unsupported" when the ring sent nothing else extended. Treating any
+                // such frame as a refusal misreads unrelated 0x2f traffic arriving
+                // mid-batch, and the misread is expensive and was permanent.
+                let answered_extended = ext.iter().any(|p| {
+                    p.tag >= protocol::HISTORY_EVENT_PREFIX
+                        || (p.tag == 0x2f && matches!(p.payload.first(), Some(0x43) | Some(0x42)))
+                });
+                let unsupported = !answered_extended
+                    && ext
+                        .iter()
+                        .any(|p| p.tag == 0x2f && p.payload.first().copied() == Some(0x00));
                 if unsupported {
+                    ext_failures += 1;
+                    ext_off_for = (1u32 << ext_failures.min(6)).min(64);
                     tracing::warn!(
                         cursor = start,
                         "ring reports the extended event API unsupported; falling back to \
@@ -536,9 +596,11 @@ impl<T: Transport> OuraClient<T> {
                         .await?,
                     );
                 } else {
+                    ext_failures = 0;
                     packets.extend(ext);
                 }
             } else {
+                ext_off_for = ext_off_for.saturating_sub(1);
                 packets.extend(
                     self.request_batch(&protocol::req_get_event(start, 255, -1), batch_terminal)
                         .await?,
@@ -570,6 +632,13 @@ impl<T: Transport> OuraClient<T> {
             }
             let bytes_left = batch.bytes_left;
             let progressed = batch.progressed(start);
+            let only_chatter =
+                !batch.events.is_empty() && batch.events.iter().all(|e| is_sync_chatter(e.tag));
+            if bytes_left == 0 && only_chatter {
+                chatter_streak += 1;
+            } else {
+                chatter_streak = 0;
+            }
             if progressed {
                 start = batch.next_cursor;
             }
@@ -583,6 +652,11 @@ impl<T: Transport> OuraClient<T> {
                 flush_ms,
                 fetch_ms,
                 ack_ms,
+                census: if batches <= 5 {
+                    format!("{} path={}", tag_census(&packets), if use_extended { "ext" } else { "legacy" })
+                } else {
+                    String::new()
+                },
             }) {
                 return Err(Error::Protocol(
                     "batch callback failed; not acknowledging batch".into(),
@@ -620,6 +694,14 @@ impl<T: Transport> OuraClient<T> {
                      contained none — stopping instead of looping (cursor {start})"
                 )));
             }
+            // Caught up with the present. "Keep pulling until a pass comes back
+            // empty" never terminates on a ring that logs every command it is sent:
+            // observed on a Gen 3 Horizon as exactly nine debug events per batch for
+            // thousands of batches, with event timestamps running ahead of the clock
+            // by one decisecond per event fetched.
+            if chatter_streak >= CHATTER_DRAINED_STREAK {
+                break;
+            }
             // `bytes_left == 0` alone is not proof the ring is drained: a Gen 3
             // Horizon (fw 3.4.3) reports 0 on the first batch and keeps serving
             // events on the next request, which used to leave a night's data on
@@ -636,7 +718,7 @@ impl<T: Transport> OuraClient<T> {
             flush_ms,
             fetch_ms,
             ack_ms,
-            path: if use_extended {
+            path: if ext_failures == 0 && ext_off_for == 0 {
                 DrainPath::Extended
             } else {
                 DrainPath::Legacy
@@ -1022,6 +1104,44 @@ mod tests {
             .writes()
             .iter()
             .all(|request| request.first() != Some(&0x10)));
+    }
+
+    /// One legacy `debug_event` (0x43) at `ts`, then a summary with bytes_left=0.
+    fn chatter_reply(ts: u32) -> String {
+        let mut event = vec![0x43, 0x08];
+        event.extend_from_slice(&ts.to_le_bytes());
+        event.extend_from_slice(b"test");
+        format!("{}1106000000000000", hex::encode(event))
+    }
+
+    #[tokio::test]
+    async fn drain_stops_when_it_is_only_fetching_its_own_debug_chatter() {
+        // Gen 3 Horizon, 2026-09-21: the firmware logs a few debug events for every
+        // command it receives, into the history buffer being drained. Each pass is
+        // therefore answered with fresh events, a pass never comes back empty, and
+        // the drain ran for hours fetching its own exhaust. Model a ring that would
+        // answer forever and require the drain to stop on its own.
+        let mock = MockTransport::new();
+        mock.on("280100", &["290100"]);
+        // no extended API on this ring
+        mock.on(&ext_request(0), &["2f0100"]);
+        for cursor in 0u32..40 {
+            mock.on(
+                &hex::encode(protocol::req_get_event(cursor, 255, -1)),
+                &[&chatter_reply(cursor)],
+            );
+            mock.on(
+                &hex::encode(protocol::req_get_event_ack(cursor)),
+                &["1106000000000000"],
+            );
+            mock.on(&ext_request(u64::from(cursor) * 100), &["2f0100"]);
+        }
+        let client = OuraClient::new(mock).with_quiet(Duration::from_millis(20));
+        let outcome = client.drain_events(0, |_| true, |_| true).await.unwrap();
+
+        assert_eq!(outcome.events_synced, CHATTER_DRAINED_STREAK);
+        assert_eq!(outcome.batches, CHATTER_DRAINED_STREAK);
+        assert_eq!(outcome.next_cursor, CHATTER_DRAINED_STREAK);
     }
 
     #[tokio::test]
