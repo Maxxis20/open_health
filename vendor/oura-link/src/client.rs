@@ -662,17 +662,16 @@ impl<T: Transport> OuraClient<T> {
                     "batch callback failed; not acknowledging batch".into(),
                 ));
             }
-            // ExtGetEvent is cursor-driven and implicitly completes its own batch.
-            // Sending the legacy GetEvent ACK here makes Ring 5 stream another batch;
-            // those late frames race with the next flush and get discarded. Only the
-            // legacy API uses the explicit 0x10 acknowledgement.
-            if progressed && !use_extended {
-                let t_ack = std::time::Instant::now();
-                let _ = self
-                    .request_tag(&protocol::req_get_event_ack(start), 0x11)
-                    .await;
-                ack_ms += t_ack.elapsed().as_millis() as u64;
-            }
+            // No per-batch acknowledgement. The legacy GetEvent ACK (max_events=0)
+            // makes the ring stream ANOTHER batch before its summary: harmless when
+            // only a few chatter events are waiting, but with a night's backlog that
+            // is 255 events over ~1.5 s, and the frames spill into the next fetch,
+            // which then collects two batches' worth without ever seeing its own
+            // summary and fails the sync (observed 2026-09-22: every attempt died at
+            // batch 4 with "492 packet(s) received"). The request carries its own
+            // start cursor, so nothing depends on the ACK; the official app sends
+            // it once after a burst, which is what the end of this loop does.
+            let _ = progressed;
             if !progressed {
                 if bytes_left == 0 {
                     break; // drained: a pass returned nothing and the ring agrees
@@ -710,6 +709,16 @@ impl<T: Transport> OuraClient<T> {
             if bytes_left == 0 {
                 tracing::debug!(cursor = start, "ring reports drained; confirming with one more pass");
             }
+        }
+        // One acknowledgement for the whole burst, legacy API only, best-effort:
+        // whatever the ring streams in reply is after the checkpointed cursor and
+        // the next sync will fetch it properly.
+        if (ext_failures > 0 || ext_off_for > 0) && total > 0 {
+            let t_ack = std::time::Instant::now();
+            let _ = self
+                .request_tag(&protocol::req_get_event_ack(start), 0x11)
+                .await;
+            ack_ms += t_ack.elapsed().as_millis() as u64;
         }
         Ok(SyncOutcome {
             events_synced: total,
@@ -1112,6 +1121,42 @@ mod tests {
         event.extend_from_slice(&ts.to_le_bytes());
         event.extend_from_slice(b"test");
         format!("{}1106000000000000", hex::encode(event))
+    }
+
+    #[tokio::test]
+    async fn legacy_drain_acks_once_after_the_burst_not_per_batch() {
+        // 2026-09-22, Gen 3 Horizon with a night's backlog: the ring answers a
+        // per-batch ACK by streaming another full batch, whose frames spill into
+        // the next fetch and break it. Only one ACK, after the last batch.
+        let mock = MockTransport::new();
+        mock.on("280100", &["290100"]);
+        for cursor in 0u32..40 {
+            mock.on(&ext_request(u64::from(cursor) * 100), &["2f0100"]);
+            mock.on(
+                &hex::encode(protocol::req_get_event(cursor, 255, -1)),
+                &[&chatter_reply(cursor)],
+            );
+            mock.on(
+                &hex::encode(protocol::req_get_event_ack(cursor)),
+                &["1106000000000000"],
+            );
+        }
+        let client = OuraClient::new(mock).with_quiet(Duration::from_millis(20));
+        let outcome = client.drain_events(0, |_| true, |_| true).await.unwrap();
+        assert!(outcome.batches >= 2);
+
+        let acks: Vec<_> = client
+            .transport()
+            .writes()
+            .into_iter()
+            .filter(|w| w.first() == Some(&0x10) && w.get(6) == Some(&0))
+            .collect();
+        assert_eq!(acks.len(), 1, "exactly one ACK for the whole burst");
+        assert_eq!(
+            acks[0],
+            protocol::req_get_event_ack(outcome.next_cursor),
+            "and it acknowledges through the final cursor"
+        );
     }
 
     #[tokio::test]
