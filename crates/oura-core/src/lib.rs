@@ -816,6 +816,22 @@ impl RingSession {
                 progress.on_progress(format!("phone anchor not saved: {error}"), 0, 0);
             }
         }
+        // Housekeeping after the drain: turn any sync exhaust the ring served into
+        // time anchors and drop it. Normally a few rows; after a runaway, a million,
+        // and the file is rewritten to give the space back.
+        match store.lock().unwrap().compact_exhaust(&serial) {
+            Ok((anchors, deleted)) if deleted > 0 => {
+                progress.on_progress(format!("compact anchors={anchors} deleted={deleted}"), 0, 0);
+                if deleted > 50_000 {
+                    progress.on_progress("vacuum".into(), 0, 0);
+                    if let Err(error) = store.lock().unwrap().vacuum() {
+                        progress.on_progress(format!("vacuum failed: {error}"), 0, 0);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => progress.on_progress(format!("compact failed: {error}"), 0, 0),
+        }
         Ok(SyncReport {
             serial,
             events_synced: outcome.events_synced,
