@@ -12,7 +12,26 @@ struct Epoch {
     fallback_anchor_unix: i64,
     anchors: Vec<(i64, i64)>, // (ring ds, UTC unix seconds)
     anchor_sources: Vec<&'static str>,
+    // Ring ds of every temperature event (0x46), sorted. The ring writes one per
+    // real minute, on a schedule the event counter does not influence, so they are
+    // a physical clock through periods where the counter itself is not.
+    temp_ticks: Vec<i64>,
 }
+
+// A Gen 3 ring emits `temp_event` (0x46) every 60 s of wall-clock time — measured
+// as a 600 ds spacing to within one decisecond across healthy nights. The event
+// counter, meanwhile, is `max(rtc_ds, last_ds + 1)`: after a sync fetched its own
+// debug exhaust for hours it sat tens of thousands of seconds ahead of the RTC and
+// then advanced one tick per event until the RTC caught up, so between two anchors
+// it either ran far too fast (the runaway) or was effectively frozen (the recovery).
+// Neither can be interpolated. Counting temperature events between the event and
+// the nearest anchor can: sixty seconds per tick, accurate to one tick.
+const TEMP_TICK_S: f64 = 60.0;
+// The tick clock is trusted for a bracket only when it accounts for the wall-clock
+// span between the two anchors. A ring that was genuinely off (charging) between
+// them has no ticks for that gap and must keep the stall arithmetic instead.
+const TICK_AGREEMENT_FRACTION: f64 = 0.1;
+const TICK_AGREEMENT_S: f64 = 10.0 * 60.0;
 
 const RESET_SLACK_DS: i64 = 6 * 3600 * 10;
 // Two anchors of one boot normally agree on the counter rate (10 ds per second, plus
@@ -54,6 +73,7 @@ impl ClockSource {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Bracket {
     Consistent,
     /// The counter lost time between the two anchors (ring powered off).
@@ -112,7 +132,11 @@ impl RingClock {
                     fallback_anchor_unix: *captured,
                     anchors: Vec::new(),
                     anchor_sources: Vec::new(),
+                    temp_ticks: Vec::new(),
                 }),
+            }
+            if *tag == 0x46 {
+                epochs.last_mut().unwrap().temp_ticks.push(*ds);
             }
             if matches!(*tag, 0x42 | 0x85) {
                 if let Ok(value) = serde_json::from_str::<Value>(json) {
@@ -126,6 +150,8 @@ impl RingClock {
         }
         for epoch in &mut epochs {
             epoch.anchors.sort_unstable();
+            epoch.temp_ticks.sort_unstable();
+            epoch.temp_ticks.dedup();
         }
         let mut anchor_offsets_ds = epochs
             .iter()
@@ -156,8 +182,36 @@ impl RingClock {
             .iter()
             .min_by_key(|(a, _)| (*a as i128 - ds as i128).unsigned_abs())
         {
-            let predicted = *anchor_unix as f64 + (ds - *anchor_ds) as f64 / 10.0;
-            match Self::bracket(&epoch.anchors, ds) {
+            let bracket = Self::bracket(&epoch.anchors, ds);
+            // Between two agreeing anchors, interpolate between them rather than
+            // extrapolate from the nearer one. On a healthy counter the two are the
+            // same; on one running a little fast or slow within tolerance — dense
+            // anchors thirty seconds apart around a counter at 13 ds/s — nearest-
+            // anchor extrapolation jumps backwards at every midpoint, and nights are
+            // found by walking events in counter order and looking at wall-clock
+            // gaps. Interpolation is exact at both anchors and monotonic between.
+            let extrapolated = *anchor_unix as f64 + (ds - *anchor_ds) as f64 / 10.0;
+            let predicted = match (bracket, Self::neighbours(&epoch.anchors, ds)) {
+                (Bracket::Consistent, Some(((prev_ds, prev_unix), (next_ds, next_unix))))
+                    if next_ds > prev_ds =>
+                {
+                    prev_unix as f64
+                        + (ds - prev_ds) as f64 / (next_ds - prev_ds) as f64
+                            * (next_unix - prev_unix) as f64
+                }
+                _ => extrapolated,
+            };
+            if !matches!(bracket, Bracket::Consistent) {
+                if let Some(unix) = Self::tick_dated(epoch, ds) {
+                    if unix <= captured_unix as f64 + FUTURE_SLACK_S {
+                        return Resolved {
+                            unix,
+                            source: ClockSource::Anchor,
+                        };
+                    }
+                }
+            }
+            match bracket {
                 Bracket::Erratic => {
                     // Any prediction would scatter the data across fabricated days.
                     return Resolved {
@@ -262,6 +316,14 @@ impl RingClock {
         serde_json::json!({ "epochs": epochs })
     }
 
+    /// The anchors immediately before and at/after `ds`, when both exist.
+    fn neighbours(anchors: &[(i64, i64)], ds: i64) -> Option<((i64, i64), (i64, i64))> {
+        let idx = anchors.partition_point(|(a, _)| *a < ds);
+        let next = anchors.get(idx).copied()?;
+        let prev = idx.checked_sub(1).map(|i| anchors[i])?;
+        Some((prev, next))
+    }
+
     /// How the anchors on either side of `ds` (sorted by ds) relate. Outside the
     /// anchored range the single nearest anchor extrapolates as usual — that is how
     /// an ordinary boot's first hours are dated.
@@ -287,6 +349,49 @@ impl RingClock {
         } else {
             Bracket::Consistent
         }
+    }
+
+    /// Date `ds` inside an abnormal bracket without trusting the counter.
+    ///
+    /// Two anchors `prev` and `next` and, between them, the ring's temperature
+    /// ticks. When the ticks account for the wall-clock gap between the anchors,
+    /// each tick is worth its share of that gap (sixty seconds, corrected for the
+    /// odd missing tick) and `ds` is placed by which tick interval it falls in,
+    /// interpolating within the interval. Continuous and monotonic in `ds`, exact
+    /// at the anchors — an earlier version that snapped to whole ticks from the
+    /// nearer anchor dated events out of order and lost whole nights.
+    fn tick_dated(epoch: &Epoch, ds: i64) -> Option<f64> {
+        let anchors = &epoch.anchors;
+        let ticks = &epoch.temp_ticks;
+        let idx = anchors.partition_point(|(a, _)| *a < ds);
+        let (Some((next_ds, next_unix)), Some((prev_ds, prev_unix))) =
+            (anchors.get(idx).copied(), idx.checked_sub(1).map(|i| anchors[i]))
+        else {
+            return None;
+        };
+        if next_ds <= prev_ds {
+            return None;
+        }
+        let wall_s = (next_unix - prev_unix) as f64;
+        let lo = ticks.partition_point(|t| *t <= prev_ds);
+        let hi = ticks.partition_point(|t| *t < next_ds);
+        let between = &ticks[lo..hi];
+        let bridged_s = between.len() as f64 * TEMP_TICK_S;
+        let tolerance = TICK_AGREEMENT_S.max(wall_s * TICK_AGREEMENT_FRACTION);
+        if between.is_empty() || (bridged_s - wall_s).abs() > tolerance {
+            return None;
+        }
+        // Interval boundaries: prev anchor, each tick, next anchor.
+        let k = between.partition_point(|t| *t <= ds);
+        let start = if k == 0 { prev_ds } else { between[k - 1] };
+        let stop = between.get(k).copied().unwrap_or(next_ds);
+        let within = if stop > start {
+            (ds - start) as f64 / (stop - start) as f64
+        } else {
+            0.0
+        };
+        let step = wall_s / (between.len() + 1) as f64;
+        Some(prev_unix as f64 + (k as f64 + within) * step)
     }
 
     fn epoch_for(&self, ds: i64, captured_unix: i64) -> &Epoch {
@@ -333,6 +438,113 @@ mod tests {
         (ds, tag, json.into(), captured)
     }
 
+    /// Anchors at `ds` 10_000 (T) and 20_000 (T + 6 h); the counter covered 1_000 s
+    /// of a 21_600 s gap — frozen, as after a runaway. 360 temperature ticks are
+    /// spread through the bracket, one per real minute.
+    fn frozen_bracket(with_ticks: bool) -> Vec<(i64, u8, String, i64)> {
+        let t = 1_800_000_000i64;
+        let mut ev = vec![
+            event(10_000, 0x42, &format!("{{\"unix_time\":{t}}}"), t),
+            event(20_000, 0x42, &format!("{{\"unix_time\":{}}}", t + 21_600), t + 21_600),
+        ];
+        if with_ticks {
+            // 360 ticks, ~27.7 ds apart in a counter that only moved 10_000 ds.
+            for i in 0..360i64 {
+                ev.push(event(10_000 + 1 + i * 10_000 / 360, 0x46, "{}", t + 21_600));
+            }
+        }
+        ev
+    }
+
+    #[test]
+    fn frozen_counter_is_dated_by_counting_temperature_ticks() {
+        let clock = RingClock::from_events(&frozen_bracket(true));
+        let t = 1_800_000_000f64;
+        // Tick #180 of 360 sits at ds 10_000 + 1 + 180 * 27.77 = 15_001.
+        let r = clock.resolve(15_001, 1_800_021_600);
+        assert!(r.source.is_dated(), "{:?}", r.source);
+        assert!(
+            (r.unix - (t + 180.0 * 60.0)).abs() <= 60.0,
+            "expected ~T+3h, got T+{:.0}s",
+            r.unix - t
+        );
+        // Near the far anchor the count runs backwards from it.
+        let r = clock.resolve(19_900, 1_800_021_600);
+        assert!((r.unix - (t + 21_600.0 - 4.0 * 60.0)).abs() <= 60.0, "T+{:.0}s", r.unix - t);
+    }
+
+    #[test]
+    fn a_real_stall_has_no_ticks_and_keeps_the_stall_arithmetic() {
+        // Same anchors, no temperature events: the ring was off in between.
+        let clock = RingClock::from_events(&frozen_bracket(false));
+        let with_ticks = RingClock::from_events(&frozen_bracket(true));
+        let stalled = clock.resolve(15_001, 1_800_021_600);
+        let ticked = with_ticks.resolve(15_001, 1_800_021_600);
+        assert_ne!(stalled.unix, ticked.unix, "the tick clock must not engage without ticks");
+    }
+
+    #[test]
+    fn runaway_counter_is_dated_by_ticks_from_dense_anchors() {
+        // The runaway: anchors every 30 s of wall time while the counter sprinted
+        // 400 ds per 30 s; one tick every other anchor pair.
+        let t = 1_800_000_000i64;
+        let mut ev = Vec::new();
+        for i in 0..20i64 {
+            ev.push(event(1_000 + i * 400, 0x42, &format!("{{\"unix_time\":{}}}", t + i * 30), t + i * 30));
+            if i % 2 == 0 {
+                ev.push(event(1_000 + i * 400 + 200, 0x46, "{}", t + i * 30));
+            }
+        }
+        let clock = RingClock::from_events(&ev);
+        let r = clock.resolve(1_000 + 7 * 400 + 100, t + 600);
+        assert!(r.source.is_dated(), "{:?}", r.source);
+        assert!((r.unix - (t as f64 + 7.0 * 30.0)).abs() <= 60.0, "T+{:.0}s", r.unix - t as f64);
+        // Never out of order across the dense anchors and the ticks between them.
+        let mut last = f64::MIN;
+        for ds in (1_000..1_000 + 19 * 400).step_by(7) {
+            let u = clock.resolve(ds, t + 600).unix;
+            assert!(u >= last, "ds {ds}: {u} < {last}");
+            last = u;
+        }
+    }
+
+    #[test]
+    fn frozen_counter_dating_is_monotonic_and_exact_at_the_anchors() {
+        let clock = RingClock::from_events(&frozen_bracket(true));
+        let t = 1_800_000_000f64;
+        let mut last = f64::MIN;
+        for ds in (10_000..=20_000).step_by(13) {
+            let u = clock.resolve(ds, 1_800_021_600).unix;
+            assert!(u >= last, "ds {ds}: {u} < {last}");
+            last = u;
+        }
+        assert!((clock.resolve(10_000, 1_800_021_600).unix - t).abs() < 1.0);
+        assert!((clock.resolve(20_000, 1_800_021_600).unix - (t + 21_600.0)).abs() < 1.0);
+    }
+
+
+    /// OURA_DB=... OURA_DS=6893000,6890500 cargo test -p oura-summary probe_local_db -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_local_db() {
+        let path = std::env::var("OURA_DB").unwrap();
+        let store = oura_store::storage::Store::open_read_only(&path).unwrap();
+        let events = store.decoded_events().unwrap();
+        let clock = RingClock::from_events(&events);
+        let captured_of = |ds: i64| events.iter().find(|e| e.0 == ds).map(|e| e.3).unwrap_or(0);
+        for ds in std::env::var("OURA_DS").unwrap().split(',').map(|v| v.parse::<i64>().unwrap()) {
+            let cu = captured_of(ds);
+            let epoch = clock.epoch_for(ds, cu);
+            let idx = epoch.anchors.partition_point(|(a, _)| *a < ds);
+            let prev = idx.checked_sub(1).map(|i| epoch.anchors[i]);
+            let next = epoch.anchors.get(idx).copied();
+            let r = clock.resolve(ds, cu);
+            let ticks = epoch.temp_ticks.len();
+            println!("ds {ds} captured {cu}: {:?} unix {:.0} | prev {:?} next {:?} | epoch ticks {ticks} anchors {} | tick_dated {:?}",
+                r.source, r.unix, prev, next, epoch.anchors.len(), RingClock::tick_dated(epoch, ds));
+        }
+    }
+
     #[test]
     fn erratic_counter_between_disagreeing_anchors_is_undated() {
         // A fresh ring: the counter advanced 28 hours of ds in one wall-clock hour
@@ -347,10 +559,13 @@ mod tests {
             event(1_200_000, 1, "{}", 1_783_000_000),
         ]);
         assert_eq!(clock.resolve(500_000, 1_783_000_000).source, ClockSource::Undated);
-        // Inside the healthy pocket the nearest anchor dates the event as usual.
+        // Inside the healthy pocket the anchors date the event as usual. The two
+        // anchors disagree by 0.3 s over 10 081 s; interpolating between them
+        // spreads that, so the result is within a second of the nearest anchor's
+        // own extrapolation rather than identical to it.
         let inside = clock.resolve(1_100_000, 1_783_000_000);
         assert_eq!(inside.source, ClockSource::Anchor);
-        assert!((inside.unix - (1_782_953_397.0 - 3_300.0)).abs() < 0.01);
+        assert!((inside.unix - (1_782_953_397.0 - 3_300.0)).abs() < 1.0);
         // Past the last anchor, extrapolation from that anchor still applies.
         assert_eq!(clock.resolve(1_200_000, 1_783_000_000).source, ClockSource::Anchor);
         assert_eq!(clock.resolve(20_000, 1_783_000_000).source, ClockSource::Anchor);
@@ -444,6 +659,7 @@ mod tests {
                     fallback_anchor_unix: 199,
                     anchors: vec![(5_000_000, 1_700_000_000)],
                     anchor_sources: vec!["time_sync"],
+                    temp_ticks: Vec::new(),
                 },
                 Epoch {
                     min_ds: 0,
@@ -453,6 +669,7 @@ mod tests {
                     fallback_anchor_unix: 299,
                     anchors: vec![(500_000, 1_800_000_000)],
                     anchor_sources: vec!["time_sync"],
+                    temp_ticks: Vec::new(),
                 },
             ],
             anchor_offsets_ds: vec![
