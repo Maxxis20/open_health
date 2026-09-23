@@ -551,14 +551,22 @@ impl<T: Transport> OuraClient<T> {
         let batch_terminal = |p: &Packet| {
             p.tag == 0x11 || (p.tag == 0x2f && matches!(p.payload.first(), Some(0x42) | Some(0x00)))
         };
+        // One data flush for the whole drain, not one per batch. The flush makes the
+        // ring commit pending records into the history buffer — once is enough for
+        // everything that happened before this sync — and on a Gen 3 Horizon it is
+        // also what writes the "check_sleep / s: / e: / not needed" debug records:
+        // about nine per flush, straight into the buffer being drained. Flushing per
+        // batch was therefore the source of the chatter the drain then fetched
+        // (see CHATTER_DRAINED_STREAK), and cost ~60 ms of round trip each time.
+        let t0 = std::time::Instant::now();
+        let flush = self.request_tag(&protocol::req_data_flush(), 0x29).await?;
+        flush_ms += t0.elapsed().as_millis() as u64;
         // Safety bound against a misbehaving ring that never reports drained.
         for _ in 0..100_000 {
             batches += 1;
             // Give up on the extended API only after repeated, unambiguous refusals.
             let mut use_extended = ext_off_for == 0 && ext_failures < 8;
-            let t0 = std::time::Instant::now();
-            let mut packets = self.request_tag(&protocol::req_data_flush(), 0x29).await?;
-            flush_ms += t0.elapsed().as_millis() as u64;
+            let mut packets = if batches == 1 { flush.clone() } else { Vec::new() };
             let t_fetch = std::time::Instant::now();
             if use_extended {
                 let ext = self
