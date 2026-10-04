@@ -499,13 +499,27 @@ struct RingSleep {
     codes: Vec<i64>,
 }
 
+/// How far before a hypnogram burst's first page the ring writes the `bedtime_period`
+/// that belongs to it. Observed 3-51 ds on a Gen 3 (fw 3.4.3); a second, unrelated
+/// period is never closer than a few minutes.
+const BURST_BEDTIME_WINDOW_DS: i64 = 2 * 60 * 10;
+
 /// Assemble `sleep_phase_data` pages into analysed sleeps and place them in time.
 ///
 /// Pages arrive as a burst with `header` counting up from zero, so a header that does
 /// not follow the previous one starts a new sleep. A page carries only the `ds` at
-/// which the ring emitted it — writing happens when analysis finishes, i.e. at the end
-/// of the sleep — so a run ends at its last page and runs back at 30 s an epoch.
-fn ring_sleep_runs(pages: &[(i64, i64, i64, Vec<i64>)]) -> Vec<RingSleep> {
+/// which the ring emitted it, and that is when analysis ran, NOT when the sleep ended:
+/// the phone triggers analysis at sync, so a 07:30 wake synced at 11:30 is emitted at
+/// 11:30. Ending the run at its last page therefore slid nights 0-5 h late.
+///
+/// The ring writes a `bedtime_period` (`bedtime_markers`: emitted ds, start, end) a few
+/// ds before the pages of the same burst, and the hypnogram covers exactly that window,
+/// padded with wake to a whole 52-epoch page. So a run starts at that period's start
+/// and is cut at its end. With no such period, fall back to ending at the last page.
+fn ring_sleep_runs(
+    pages: &[(i64, i64, i64, Vec<i64>)],
+    bedtime_markers: &[(i64, i64, i64)],
+) -> Vec<RingSleep> {
     let epoch_ds = (RING_STAGE_EPOCH_S * 10.0) as i64;
     let mut runs: Vec<RingSleep> = Vec::new();
     let mut previous_page = -1i64;
@@ -526,7 +540,24 @@ fn ring_sleep_runs(pages: &[(i64, i64, i64, Vec<i64>)]) -> Vec<RingSleep> {
         previous_page = *page;
     }
     for run in &mut runs {
-        run.start_ds = run.end_ds - run.codes.len() as i64 * epoch_ds;
+        let first_page_ds = run.start_ds;
+        let span_ds = run.codes.len() as i64 * epoch_ds;
+        let marker = bedtime_markers
+            .iter()
+            .filter(|&&(emitted, start, end)| {
+                (first_page_ds - BURST_BEDTIME_WINDOW_DS..=first_page_ds).contains(&emitted)
+                    && start < end
+                    && end <= emitted
+            })
+            .max_by_key(|&&(emitted, _, _)| emitted);
+        match marker {
+            Some(&(_, start, end)) => {
+                run.start_ds = start;
+                run.end_ds = end.min(start + span_ds);
+                run.codes.truncate(((run.end_ds - start) / epoch_ds).max(1) as usize);
+            }
+            None => run.start_ds = run.end_ds - span_ds,
+        }
     }
     runs
 }
@@ -1261,6 +1292,8 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
     let mut raw_beds: Vec<BedPeriod> = Vec::new();
     let mut sleep_support: Vec<(i64, i64)> = Vec::new();
     let mut ring_hypnogram_pages: Vec<(i64, i64, i64, Vec<i64>)> = Vec::new();
+    // (emitted ds, bedtime_start_ds, bedtime_end_ds): places each hypnogram burst.
+    let mut bedtime_markers: Vec<(i64, i64, i64)> = Vec::new();
     // (ds, sleep_state) straight from the ring: its own asleep/awake call per window.
     let mut ring_sleep_state: Vec<(i64, i64)> = Vec::new();
     let mut pulse_support: Vec<(i64, i64, usize)> = Vec::new();
@@ -1284,6 +1317,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
                 if let (Some(s), Some(e)) =
                     (v["bedtime_start_ds"].as_i64(), v["bedtime_end_ds"].as_i64())
                 {
+                    bedtime_markers.push((*ds, s, e));
                     match raw_beds.iter_mut().find(|bed| {
                         bed.start_ds == s
                             && (unix_s_at(bed.start_ds, bed.captured_unix) - unix_s_at(s, *cu))
@@ -1367,7 +1401,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
             }
         }
     }
-    let ring_sleeps = ring_sleep_runs(&ring_hypnogram_pages);
+    let ring_sleeps = ring_sleep_runs(&ring_hypnogram_pages, &bedtime_markers);
     raw_beds.extend(beds_from_sleep_signal(
         &raw_beds,
         &ring_sleeps,
@@ -2201,6 +2235,40 @@ mod tests {
             ds as f64 / 10.0
         });
         assert_eq!(got[0].end_ds, 0);
+    }
+
+    fn pages(first_ds: i64, epochs: &[usize]) -> Vec<(i64, i64, i64, Vec<i64>)> {
+        epochs
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (first_ds + i as i64, 1, i as i64, vec![2; n]))
+            .collect()
+    }
+
+    #[test]
+    fn hypnogram_emitted_at_a_late_sync_is_placed_by_its_bedtime_period() {
+        // Observed 2026-10-03: in bed 23:00 -> 09:14 (10.23 h), synced at 11:36. The
+        // pages were emitted at the sync; anchoring their end there put the night
+        // 2.4 h late. The burst's own bedtime_period carries the real window.
+        let (bed_start, bed_end) = (16_766_735, 17_135_035);
+        let burst = 17_220_283;
+        let mut epochs = vec![52; 23];
+        epochs.push(52); // last page: wake padding past the bedtime end
+        let runs = ring_sleep_runs(&pages(burst, &epochs), &[(burst - 44, bed_start, bed_end)]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start_ds, bed_start);
+        assert_eq!(runs[0].end_ds, bed_end);
+        assert_eq!(runs[0].codes.len() as i64, (bed_end - bed_start) / 300);
+    }
+
+    #[test]
+    fn hypnogram_without_its_bedtime_period_still_ends_at_its_last_page() {
+        let burst = 1_000_000;
+        // a bedtime period from an earlier burst must not be borrowed
+        let stale = (burst - 30 * 60 * 10, 500_000, 800_000);
+        let runs = ring_sleep_runs(&pages(burst, &[52, 52]), &[stale]);
+        assert_eq!(runs[0].end_ds, burst + 1);
+        assert_eq!(runs[0].start_ds, burst + 1 - 104 * 300);
     }
 
     #[test]
