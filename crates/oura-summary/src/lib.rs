@@ -651,6 +651,24 @@ fn ring_hypnograms(runs: &[RingSleep], nights: &[Night]) -> Vec<(i64, Value)> {
     out
 }
 
+/// A `bedtime_period` the ring went on to stage is as authoritative as the staged
+/// sleep itself: its hypnogram burst is placed from it ([`ring_sleep_runs`]), so the
+/// two coincide. Mark it staged so [`normalize_bed_periods`] neither stretches its end
+/// with daytime HR sampling nor lets an earlier doze grow across its start.
+///
+/// Observed 2026-10-04: ring bedtime 01:48 -> 08:49, confirmed by the wearer; shown as
+/// 23:38 -> 11:47 because neither guard applied to an unstaged explicit period.
+fn mark_staged_beds(beds: &mut [BedPeriod], ring_sleeps: &[RingSleep]) {
+    for bed in beds.iter_mut() {
+        if ring_sleeps
+            .iter()
+            .any(|run| run.start_ds == bed.start_ds && run.end_ds <= bed.end_ds)
+        {
+            bed.staged = true;
+        }
+    }
+}
+
 /// Nights the ring recorded but never declared.
 ///
 /// `bedtime_period` is the ring's own verdict and is trusted first, but it is not
@@ -853,6 +871,9 @@ fn normalize_bed_periods(
                 && raw_gap_ds >= -MAX_SLEEP_SIGNAL_EXTENSION_DS
                 && wall_gap_s >= -(MAX_SLEEP_SIGNAL_EXTENSION_DS as f64 / 10.0)
                 && !awake_throughout(previous.end_ds, period.start_ds)
+                // a staged window is the ring's own verdict: an unstaged neighbour
+                // may not widen it from either side
+                && previous.staged == period.staged
             {
                 previous.end_ds = previous.end_ds.max(period.end_ds);
                 previous.raw_start_ds = previous.raw_start_ds.min(period.raw_start_ds);
@@ -1402,6 +1423,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         }
     }
     let ring_sleeps = ring_sleep_runs(&ring_hypnogram_pages, &bedtime_markers);
+    mark_staged_beds(&mut raw_beds, &ring_sleeps);
     raw_beds.extend(beds_from_sleep_signal(
         &raw_beds,
         &ring_sleeps,
@@ -2269,6 +2291,34 @@ mod tests {
         let runs = ring_sleep_runs(&pages(burst, &[52, 52]), &[stale]);
         assert_eq!(runs[0].end_ds, burst + 1);
         assert_eq!(runs[0].start_ds, burst + 1 - 104 * 300);
+    }
+
+    #[test]
+    fn a_staged_bedtime_is_neither_stretched_nor_swallowed_by_an_earlier_doze() {
+        // Sat 10-03 -> 10-04: ring bedtime 01:48 -> 08:49 (confirmed), a 15-minute
+        // doze at 23:38, and hourly-ish nocturnal + HR samples after waking.
+        let minute = 60 * 10;
+        let doze = bed(0, 15 * minute);
+        let night = bed(130 * minute, 551 * minute);
+        let burst = 700 * minute;
+        let runs = ring_sleep_runs(
+            &pages(burst, &[52; 9]),
+            &[(burst - 24, night.start_ds, night.end_ds)],
+        );
+        let mut beds = vec![doze, night];
+        mark_staged_beds(&mut beds, &runs);
+        assert!(!beds[0].staged && beds[1].staged);
+
+        let support: Vec<_> = (20..=125)
+            .step_by(15)
+            .chain((560..=640).step_by(15))
+            .map(|m| (m * minute, 1))
+            .collect();
+        let pulses: Vec<_> = (555..=720).step_by(10).map(|m| (m * minute, 1, 6)).collect();
+        let got = normalize_bed_periods(beds, &support, &pulses, &[], |ds, _| ds as f64 / 10.0);
+        let main = got.iter().find(|b| b.staged).expect("staged night kept");
+        assert_eq!((main.start_ds, main.end_ds), (night.start_ds, night.end_ds));
+        assert!(got.iter().all(|b| b.staged || b.end_ds <= night.start_ds));
     }
 
     #[test]
